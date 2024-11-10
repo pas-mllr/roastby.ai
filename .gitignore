@@ -7,3 +7,7 @@ venv/
 # Ignore environment variables and tokens
 .env
 strava_tokens.json
+
+# Ignore Streamlit secrets
+secrets.toml
+.streamlit/secrets.toml

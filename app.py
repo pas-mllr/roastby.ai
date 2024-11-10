@@ -1,133 +1,118 @@
 import streamlit as st
 import requests
-import time
 import json
+import time
 import os
-from dotenv import load_dotenv
+import urllib.parse
 import openai
 
-# ================================
-# Load Environment Variables
-# ================================
+# Strava API endpoints
+AUTHORIZE_URL = "https://www.strava.com/oauth/authorize"
+TOKEN_URL = "https://www.strava.com/oauth/token"
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Retrieve API keys and tokens from environment variables
-CLIENT_ID = os.getenv('STRAVA_CLIENT_ID')            # Replace with your Strava Client ID
-CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')    # Replace with your Strava Client Secret
-AUTHORIZATION_CODE = os.getenv('STRAVA_AUTHORIZATION_CODE')  # Replace with your Strava Authorization Code
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')         # Replace with your OpenAI API Key
-
-# Validate that all required credentials are available
-if not CLIENT_ID or not CLIENT_SECRET or not AUTHORIZATION_CODE or not OPENAI_API_KEY:
-    st.error("Please ensure all credentials are set in the .env file.")
-    st.stop()
+# Retrieve API keys from Streamlit secrets or environment variables
+CLIENT_ID = st.secrets.get("STRAVA_CLIENT_ID") or os.getenv('STRAVA_CLIENT_ID')
+CLIENT_SECRET = st.secrets.get("STRAVA_CLIENT_SECRET") or os.getenv('STRAVA_CLIENT_SECRET')
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv('OPENAI_API_KEY')
+REDIRECT_URI = st.secrets.get("REDIRECT_URI") or os.getenv('REDIRECT_URI') or 'http://localhost:8501'
 
 # Set OpenAI API key
 openai.api_key = OPENAI_API_KEY
 
-TOKEN_FILE = 'strava_tokens.json'
+# Validate that all required credentials are available
+if not CLIENT_ID or not CLIENT_SECRET or not OPENAI_API_KEY or not REDIRECT_URI:
+    st.error("Please ensure all credentials are set.")
+    st.stop()
 
-# ================================
-# Functions for Token Management
-# ================================
+def main():
+    st.title("Strava Activity Roaster with GPT-4")
+    st.write("Welcome! This app fetches your Strava bio and recent activities to provide an AI-generated roast.")
 
-def get_access_token():
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'r') as f:
-            tokens = json.load(f)
+    # Initialize session state
+    if 'access_token' not in st.session_state:
+        st.session_state['access_token'] = None
+
+    # Check if access token is available
+    if st.session_state['access_token'] is None:
+        # Check for authorization code in URL
+        query_params = st.experimental_get_query_params()
+        if 'code' in query_params:
+            code = query_params['code'][0]
+            # Exchange code for access token
+            access_token = exchange_code_for_token(code)
+            if access_token:
+                st.session_state['access_token'] = access_token
+                # Clear query params to clean up URL
+                st.experimental_set_query_params()
+                st.experimental_rerun()
+            else:
+                st.error("Failed to get access token.")
+        else:
+            # Display login button
+            if st.button("Login with Strava"):
+                # Redirect user to Strava's authorization URL
+                auth_url = get_strava_auth_url(REDIRECT_URI)
+                # Redirect to the authorization URL
+                st.experimental_set_query_params()
+                js = f"""<script type="text/javascript">
+                        window.location.href = "{auth_url}";
+                        </script>"""
+                st.markdown(js, unsafe_allow_html=True)
+            else:
+                st.write("Please log in with Strava to continue.")
     else:
-        tokens = exchange_authorization_code(AUTHORIZATION_CODE)
-        if not tokens:
-            st.error("Failed to obtain tokens.")
-            st.stop()
+        # User is logged in, proceed to fetch data and generate roast
+        run_app_logic()
 
-    current_time = int(time.time())
-    if tokens['expires_at'] < current_time:
-        tokens = refresh_access_token(tokens['refresh_token'])
-        if not tokens:
-            st.error("Failed to refresh tokens.")
-            st.stop()
+def get_strava_auth_url(redirect_uri):
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "approval_prompt": "auto",
+        "scope": "read,activity:read_all"
+    }
+    url = f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+    return url
 
-    return tokens['access_token']
-
-def exchange_authorization_code(auth_code):
+def exchange_code_for_token(code):
     response = requests.post(
-        'https://www.strava.com/oauth/token',
+        TOKEN_URL,
         data={
             'client_id': CLIENT_ID,
             'client_secret': CLIENT_SECRET,
-            'code': auth_code,
+            'code': code,
             'grant_type': 'authorization_code'
         }
     )
-
     if response.status_code == 200:
         tokens = response.json()
-        save_tokens(tokens)
-        return tokens
+        return tokens['access_token']
     else:
         st.error(f"Error exchanging authorization code: {response.text}")
         return None
 
-def refresh_access_token(refresh_token):
-    response = requests.post(
-        'https://www.strava.com/oauth/token',
-        data={
-            'client_id': CLIENT_ID,
-            'client_secret': CLIENT_SECRET,
-            'grant_type': 'refresh_token',
-            'refresh_token': refresh_token
-        }
-    )
-
+def get_athlete_profile():
+    headers = {'Authorization': f"Bearer {st.session_state['access_token']}"}
+    response = requests.get('https://www.strava.com/api/v3/athlete', headers=headers)
     if response.status_code == 200:
-        tokens = response.json()
-        save_tokens(tokens)
-        return tokens
-    else:
-        st.error(f"Error refreshing access token: {response.text}")
-        return None
-
-def save_tokens(tokens):
-    with open(TOKEN_FILE, 'w') as f:
-        json.dump(tokens, f)
-
-# ================================
-# Functions for Fetching Data
-# ================================
-
-def get_athlete_profile(access_token):
-    headers = {'Authorization': f'Bearer {access_token}'}
-    response = requests.get(
-        'https://www.strava.com/api/v3/athlete',
-        headers=headers
-    )
-    if response.status_code == 200:
-        athlete = response.json()
-        return athlete
+        return response.json()
     else:
         st.error(f"Error fetching athlete profile: {response.text}")
         return None
 
-def get_activities(access_token, num_activities=10):
-    headers = {'Authorization': f'Bearer {access_token}'}
+def get_activities(num_activities=5):
+    headers = {'Authorization': f"Bearer {st.session_state['access_token']}"}
     response = requests.get(
         'https://www.strava.com/api/v3/athlete/activities',
         headers=headers,
         params={'per_page': num_activities}
     )
     if response.status_code == 200:
-        activities = response.json()
-        return activities
+        return response.json()
     else:
         st.error(f"Error fetching activities: {response.text}")
         return []
-
-# ================================
-# Function to Construct Prompt
-# ================================
 
 def construct_prompt(athlete, activities):
     # Extract bio information
@@ -183,15 +168,11 @@ Be creative, but keep it friendly and avoid offensive language. The roast should
 """
     return prompt
 
-# ================================
-# Function to Generate Roast
-# ================================
-
 def generate_roast(prompt):
     try:
         with st.spinner('Generating roast...'):
             completion = openai.chat.completions.create(
-                model="gpt-4",  # Ensure this is the correct model name
+                model="gpt-4",
                 messages=[
                     {"role": "system", "content": "You are a sarcastic fitness coach who provides humorous roasts based on user's bio and workout data."},
                     {"role": "user", "content": prompt}
@@ -204,29 +185,12 @@ def generate_roast(prompt):
     except Exception as e:
         return f"Error generating roast: {e}"
 
-# ================================
-# Streamlit App
-# ================================
-
-def main():
-    st.title("Roast My Strava")
-    st.write("This app fetches your Strava bio and recent activities to provide an AI-generated roast.")
-
-    # Get the access token
-    access_token = get_access_token()
-
-    # Fetch athlete profile
-    athlete = get_athlete_profile(access_token)
-
+def run_app_logic():
+    athlete = get_athlete_profile()
     if athlete:
-        # Fetch last 10 activities
-        activities = get_activities(access_token, num_activities=10)
-
+        activities = get_activities(num_activities=5)
         if activities:
-            # Construct the prompt
             prompt = construct_prompt(athlete, activities)
-
-            # Generate the roast
             roast = generate_roast(prompt)
 
             # Display the bio
